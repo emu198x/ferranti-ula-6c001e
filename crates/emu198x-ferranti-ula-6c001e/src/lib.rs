@@ -8,10 +8,10 @@
 #[doc(hidden)]
 pub mod hdl_model;
 
-use common_sinclair_zx_spectrum::memory::MemoryBus;
-use common_sinclair_zx_spectrum::timing::{self, FrameTiming};
-use common_sinclair_zx_spectrum::ula::Ula;
-use common_sinclair_zx_spectrum::ula_engine::{self, DELAY_TABLE_48K, UlaEngine};
+use emu198x_bus_sinclair_zx_spectrum::MemoryBus;
+use emu198x_bus_sinclair_zx_spectrum::Ula;
+use emu198x_bus_sinclair_zx_spectrum::timing::{self, FrameTiming};
+use emu198x_sinclair_zx_spectrum_ula::{self as ula_engine, DELAY_TABLE_48K, UlaEngine};
 
 /// Ferranti 6C001E ULA — the 48K ZX Spectrum's custom chip.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -364,7 +364,7 @@ mod tests {
     /// where it runs.
     #[test]
     fn the_recorder_captures_the_state_each_decision_was_made_on() {
-        use common_sinclair_zx_spectrum::timing;
+        use emu198x_bus_sinclair_zx_spectrum::timing;
 
         let mut ula = FerrantiUla::new(UlaRevision::Ferranti6C);
         let mut fb = vec![0; timing::SCREEN_WIDTH * timing::SCREEN_HEIGHT];
@@ -441,7 +441,7 @@ mod tests {
         }
     }
 
-    use common_sinclair_zx_spectrum::timing;
+    use emu198x_bus_sinclair_zx_spectrum::timing;
 
     struct ContendedMemory;
 

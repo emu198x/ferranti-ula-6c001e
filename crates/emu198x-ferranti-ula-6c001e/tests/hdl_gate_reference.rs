@@ -66,7 +66,7 @@
 //! of the obvious ones does it.
 //!
 //! ```sh
-//! cargo test -p ferranti-ula-6c001e --test hdl_gate_reference -- --nocapture
+//! cargo test -p emu198x-ferranti-ula-6c001e --test hdl_gate_reference -- --nocapture
 //! ```
 
 // The gate expressions below mirror the Verilog line for line, including
@@ -78,7 +78,7 @@
 // The model itself lives in the crate, not here. A second transcription
 // in this file is what it was written to avoid: two copies drift, and a
 // drifting reference is worse than none.
-use ferranti_ula_6c001e::hdl_model::{HdlGate, Pins};
+use emu198x_ferranti_ula_6c001e::hdl_model::{HdlGate, Pins};
 
 /// One Z80 T-state's worth of pins, as the gate sees them.
 ///
@@ -576,10 +576,10 @@ fn the_hdl_model_reproduces_fuse_m1_contention() {
 // from the same source the model uses, so any divergence is the gate's.
 // =====================================================================
 
-use common_sinclair_zx_spectrum::memory::MemoryBus;
-use common_sinclair_zx_spectrum::timing::{SCREEN_HEIGHT, SCREEN_WIDTH};
-use common_sinclair_zx_spectrum::ula::Ula;
-use ferranti_ula_6c001e::{FerrantiUla, UlaRevision};
+use emu198x_bus_sinclair_zx_spectrum::MemoryBus;
+use emu198x_bus_sinclair_zx_spectrum::Ula;
+use emu198x_bus_sinclair_zx_spectrum::timing::{SCREEN_HEIGHT, SCREEN_WIDTH};
+use emu198x_ferranti_ula_6c001e::{FerrantiUla, UlaRevision};
 
 /// Memory that answers only the question the gate asks.
 struct ContendedLower16K;
