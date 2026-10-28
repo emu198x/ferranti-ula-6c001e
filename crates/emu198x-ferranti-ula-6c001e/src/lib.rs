@@ -584,4 +584,415 @@ mod tests {
         ula.write_fe(0x18);
         assert_eq!(ula.read_fe(0xFFFE, &empty_keyboard()) & 0x40, 0x40);
     }
+
+    /// Memory with nothing contended, for driving the ULA where the
+    /// address must not be what stalls the CPU.
+    struct UncontendedMemory;
+
+    impl MemoryBus for UncontendedMemory {
+        fn read(&self, _addr: u16) -> u8 {
+            0
+        }
+
+        fn write(&mut self, _addr: u16, _value: u8) {}
+
+        fn is_contended(&self, _addr: u16) -> bool {
+            false
+        }
+    }
+
+    /// Memory whose every byte names its own address, so a value seen on
+    /// the ULA's data bus says which address the ULA fetched. `$4000`
+    /// reads `$40`, `$5800` reads `$58`, `$4001` reads `$41`. Only
+    /// `$4000..=$7FFF` is contended, as on the 48K.
+    struct AddressedMemory;
+
+    impl MemoryBus for AddressedMemory {
+        fn read(&self, addr: u16) -> u8 {
+            (addr ^ (addr >> 8)) as u8
+        }
+
+        fn write(&mut self, _addr: u16, _value: u8) {}
+
+        fn is_contended(&self, addr: u16) -> bool {
+            (0x4000..0x8000).contains(&addr)
+        }
+    }
+
+    fn framebuffer() -> Vec<u8> {
+        vec![0; timing::SCREEN_WIDTH * timing::SCREEN_HEIGHT]
+    }
+
+    /// A ULA placed at a raster position, with the CPU clock about to
+    /// run the given phase.
+    fn ula_at(scan: u16, pixel: u16) -> FerrantiUla {
+        let mut ula = FerrantiUla::new(UlaRevision::Ferranti6C);
+        ula.engine.scan = scan;
+        ula.engine.pixel = pixel;
+        ula
+    }
+
+    #[test]
+    fn a_new_ula_reports_its_revision_and_power_on_state() {
+        for revision in [UlaRevision::Ferranti5C, UlaRevision::Ferranti6C] {
+            let ula = FerrantiUla::new(revision);
+            assert_eq!(ula.revision(), revision);
+            assert_eq!(
+                ula.border_color(),
+                7,
+                "the engine powers on with a white border"
+            );
+            assert!(!ula.speaker(), "the speaker bit starts low");
+            assert!(ula.cpu_clock_active(), "the CPU clock starts running");
+            assert!(!ula.interrupt_active(), "INT starts released");
+            assert_eq!(ula.floating_bus(), 0xFF, "the bus starts idle");
+            assert_eq!(ula.debug_raster(), (0, 0, false, true, 0xFF));
+        }
+    }
+
+    #[test]
+    fn writing_port_fe_sets_the_border_from_bits_0_to_2_and_the_speaker_from_bit_4() {
+        let mut ula = FerrantiUla::new(UlaRevision::Ferranti6C);
+
+        ula.write_fe(0x15);
+        assert_eq!(ula.border_color(), 5);
+        assert!(ula.speaker(), "bit 4 set drives the speaker high");
+
+        // MIC (bit 3) alone is not the speaker, and bits 5-7 are not
+        // border colour.
+        ula.write_fe(0xEA);
+        assert_eq!(ula.border_color(), 2);
+        assert!(!ula.speaker(), "bit 4 clear drives the speaker low");
+    }
+
+    #[test]
+    fn reading_port_fe_returns_the_selected_keyboard_rows_with_bits_5_and_7_high() {
+        let mut ula = FerrantiUla::new(UlaRevision::Ferranti6C);
+        ula.write_fe(0x00);
+        let mut keyboard = empty_keyboard();
+        // Row 0 (high byte bit 0 low) with its bit-0 key held down, and
+        // row 1 with its bit-1 key held down.
+        keyboard[0] = 0xFE;
+        keyboard[1] = 0xFD;
+
+        assert_eq!(
+            ula.read_fe(0xFEFE, &keyboard),
+            0xBE,
+            "only row 0 is selected, so only its key reads low",
+        );
+        assert_eq!(
+            ula.read_fe(0xFDFE, &keyboard),
+            0xBD,
+            "only row 1 is selected, so only its key reads low",
+        );
+        assert_eq!(
+            ula.read_fe(0xFCFE, &keyboard),
+            0xBC,
+            "two selected rows are ANDed together",
+        );
+        assert_eq!(
+            ula.read_fe(0xFFFE, &keyboard),
+            0xBF,
+            "no selected row reads as no key pressed",
+        );
+
+        // EAR feedback sets bit 6 without disturbing the keyboard bits.
+        ula.write_fe(0x10);
+        assert_eq!(ula.read_fe(0xFEFE, &keyboard), 0xFE);
+    }
+
+    #[test]
+    fn the_frame_timing_is_the_48k_frame() {
+        let ula = FerrantiUla::new(UlaRevision::Ferranti6C);
+        let frame = ula.frame_timing();
+        assert_eq!(*frame, timing::TIMING_48K);
+        assert_eq!(frame.tstates_per_line, 224);
+        assert_eq!(frame.lines_per_frame, 312);
+        assert_eq!(frame.tstates_per_frame, 69_888);
+    }
+
+    /// The 48K engine raises INT on scan 248 at pixel 1 and drops it at
+    /// pixel 65: 64 half-cycles, which must be the 32 T-states the frame
+    /// timing reports.
+    #[test]
+    fn the_interrupt_is_held_for_the_frame_timings_32_t_states_on_scan_248() {
+        let mut ula = ula_at(248, 0);
+        let mut fb = framebuffer();
+
+        let held: Vec<bool> = (0..80)
+            .map(|_| {
+                ula.tick(&UncontendedMemory, 0x0000, false, false, false, &mut fb);
+                ula.interrupt_active()
+            })
+            .collect();
+
+        assert!(!held[0], "INT is not yet raised by the tick at pixel 0");
+        assert!(held[1], "INT rises on the tick at pixel 1");
+        assert!(
+            held[1..65].iter().all(|&on| on),
+            "INT holds through pixel 64"
+        );
+        assert!(held[65..].iter().all(|&on| !on), "INT drops at pixel 65");
+
+        let half_cycles = held.iter().filter(|&&on| on).count() as u32;
+        assert_eq!(half_cycles, 2 * ula.frame_timing().interrupt_length_tstates);
+    }
+
+    #[test]
+    fn the_interrupt_is_never_raised_away_from_scan_248() {
+        let mut ula = ula_at(247, 0);
+        let mut fb = framebuffer();
+        for _ in 0..448 {
+            ula.tick(&UncontendedMemory, 0x0000, false, false, false, &mut fb);
+            assert!(!ula.interrupt_active());
+        }
+        assert_eq!(
+            ula.debug_raster().0,
+            248,
+            "a whole line moves to the next scan"
+        );
+    }
+
+    #[test]
+    fn end_frame_returns_the_raster_to_the_top_and_counts_the_flash_phase() {
+        let mut ula = ula_at(200, 123);
+        ula.end_frame();
+        let (scan, pixel, ..) = ula.debug_raster();
+        assert_eq!((scan, pixel), (0, 0));
+
+        // The flash counter wraps at 32 frames and flash is active for
+        // the second half of the cycle.
+        let mut ula = FerrantiUla::new(UlaRevision::Ferranti6C);
+        for frame in 1..=32u8 {
+            ula.end_frame();
+            assert_eq!(ula.engine.flash_counter, frame & 0x1F);
+            assert_eq!(
+                ula.engine.flash_active,
+                (16..32).contains(&frame),
+                "flash phase after {frame} frames",
+            );
+        }
+    }
+
+    /// The floating bus carries the byte of each VRAM fetch while the
+    /// fetch window is open, and `$FF` while it is idle. On scan 0 the
+    /// fetches at pixels 8, 10, 12 and 14 read bitmap `$4000`,
+    /// attribute `$5800`, bitmap `$4001` and attribute `$5801`.
+    #[test]
+    fn the_floating_bus_carries_each_screen_fetch_and_is_ff_when_idle() {
+        let mut ula = ula_at(0, 0);
+        let mut fb = framebuffer();
+
+        let bus: Vec<u8> = (0..17)
+            .map(|_| {
+                ula.tick(&AddressedMemory, 0x0000, false, false, false, &mut fb);
+                ula.floating_bus()
+            })
+            .collect();
+
+        assert!(
+            bus[..8].iter().all(|&b| b == 0xFF),
+            "idle before the fetch window"
+        );
+        assert_eq!(bus[8], 0x40, "bitmap fetch from $4000");
+        assert_eq!(bus[9], 0x40, "the bus holds between fetches");
+        assert_eq!(bus[10], 0x58, "attribute fetch from $5800");
+        assert_eq!(bus[12], 0x41, "bitmap fetch from $4001");
+        assert_eq!(bus[14], 0x59, "attribute fetch from $5801");
+        assert_eq!(bus[16], 0xFF, "idle again between fetch groups");
+
+        let (scan, pixel, video, idle, bus_data) = ula.debug_raster();
+        assert_eq!((scan, pixel, video, idle), (0, 17, true, true));
+        assert_eq!(
+            bus_data, 0x59,
+            "the raw bus byte is kept under the idle level"
+        );
+    }
+
+    /// The Ferranti ULA ignores /RFSH, so a refresh address in
+    /// `$4000..=$7FFF` replaces the address of a colliding video fetch.
+    #[test]
+    fn a_refresh_in_screen_ram_replaces_the_fetched_address_with_snow() {
+        let fetch_at_pixel_8 = |addr: u16, rfsh: bool| {
+            let mut ula = ula_at(0, 0);
+            let mut fb = framebuffer();
+            for _ in 0..9 {
+                ula.tick(&AddressedMemory, addr, false, false, rfsh, &mut fb);
+            }
+            ula.floating_bus()
+        };
+
+        assert_eq!(
+            fetch_at_pixel_8(0x7F00, true),
+            0x7F,
+            "I=$7F refresh is fetched"
+        );
+        assert_eq!(
+            fetch_at_pixel_8(0x3F00, true),
+            0x40,
+            "a refresh outside screen RAM leaves the fetch alone",
+        );
+        assert_eq!(
+            fetch_at_pixel_8(0x7F00, false),
+            0x40,
+            "without /RFSH the address is not a refresh",
+        );
+    }
+
+    /// Contention is confined to the first 256 pixels of the 192 display
+    /// lines. The same contended pin sequence that stalls the CPU inside
+    /// that window never stalls it outside.
+    #[test]
+    fn the_cpu_clock_is_only_withheld_inside_the_contention_window() {
+        let stalls = |scan: u16, pixel: u16, ticks: usize, memory: &dyn MemoryBus| {
+            let mut ula = ula_at(scan, pixel);
+            let mut fb = framebuffer();
+            (0..ticks)
+                .filter(|_| {
+                    ula.tick(memory, 0x4000, false, false, false, &mut fb);
+                    !ula.cpu_clock_active()
+                })
+                .count()
+        };
+
+        assert!(
+            stalls(100, 0, 256, &ContendedMemory) > 0,
+            "the control run must stall, or the others prove nothing",
+        );
+        assert_eq!(
+            stalls(100, 256, 192, &ContendedMemory),
+            0,
+            "right of the window"
+        );
+        assert_eq!(
+            stalls(192, 0, 448, &ContendedMemory),
+            0,
+            "below the display"
+        );
+        assert_eq!(
+            stalls(300, 0, 448, &ContendedMemory),
+            0,
+            "in the top border"
+        );
+        assert_eq!(
+            stalls(100, 0, 256, &UncontendedMemory),
+            0,
+            "an uncontended address is never held",
+        );
+    }
+
+    /// FUSE's port classes, as the code documents them: an even port is
+    /// answered by the ULA and contended whatever its page, an odd port
+    /// on an uncontended page is never contended, and an odd port on a
+    /// contended page is.
+    #[test]
+    fn port_contention_depends_on_the_port_parity_and_the_page() {
+        let stalls_anywhere = |port: u16, memory: &dyn MemoryBus| {
+            let mut stalled = false;
+            for arrival in 0..16u16 {
+                for arms_first in [false, true] {
+                    let mut ula = ula_at(100, 128 + arrival);
+                    ula.engine.z80_clock_high = !arms_first;
+                    let mut fb = framebuffer();
+                    // Two strobe-free ticks, then IORQ held; it rises on
+                    // an arming half-cycle in one of the two parities.
+                    for tick in 0..10 {
+                        let iorq = tick >= 2;
+                        ula.tick(memory, port, false, iorq, false, &mut fb);
+                        stalled |= !ula.cpu_clock_active();
+                    }
+                }
+            }
+            stalled
+        };
+
+        assert!(
+            stalls_anywhere(0x00FE, &UncontendedMemory),
+            "even, uncontended page"
+        );
+        assert!(
+            stalls_anywhere(0x40FE, &AddressedMemory),
+            "even, contended page"
+        );
+        assert!(
+            stalls_anywhere(0x40FF, &AddressedMemory),
+            "odd, contended page"
+        );
+        assert!(
+            !stalls_anywhere(0x00FF, &UncontendedMemory),
+            "odd, uncontended page"
+        );
+    }
+
+    #[test]
+    fn the_recorder_is_off_until_armed_and_rearming_discards_the_old_recording() {
+        let mut ula = ula_at(100, 0);
+        let mut fb = framebuffer();
+
+        for _ in 0..4 {
+            ula.tick(&ContendedMemory, 0x4000, false, false, false, &mut fb);
+        }
+        assert!(
+            ula.debug_trace_take().is_empty(),
+            "nothing is recorded unarmed"
+        );
+
+        ula.debug_trace_start();
+        for _ in 0..3 {
+            ula.tick(&ContendedMemory, 0x4000, false, false, false, &mut fb);
+        }
+        ula.debug_trace_start();
+        let mut clocks = Vec::new();
+        let mut falls = Vec::new();
+        for _ in 0..2 {
+            ula.tick(&ContendedMemory, 0x4000, false, false, false, &mut fb);
+            clocks.push(ula.cpu_clock_active());
+            falls.push(ula.engine.mcycle_fall);
+        }
+
+        let trace = ula.debug_trace_take();
+        assert_eq!(trace.len(), 2, "re-arming dropped the first three entries");
+        for (i, tick) in trace.iter().enumerate() {
+            assert_eq!(tick.pixel, 7 + i as u16, "entry {i} pixel");
+            assert_eq!(tick.cpu_clock_after, clocks[i], "entry {i} clock decision");
+            assert_eq!(tick.mcycle_fall, falls[i], "entry {i} M-cycle position");
+        }
+    }
+
+    #[test]
+    fn reattaching_the_config_leaves_a_running_ula_unchanged() {
+        let mut fb_plain = framebuffer();
+        let mut fb_reattached = framebuffer();
+        let mut plain = ula_at(247, 400);
+        plain.write_fe(0x03);
+        let mut reattached = plain.clone();
+        reattached.reattach_config();
+
+        // Across the end of scan 247, the interrupt on 248, and a frame
+        // wrap from the last line.
+        for _ in 0..(448 * 66) {
+            plain.tick(&AddressedMemory, 0x4000, false, false, false, &mut fb_plain);
+            reattached.tick(
+                &AddressedMemory,
+                0x4000,
+                false,
+                false,
+                false,
+                &mut fb_reattached,
+            );
+            assert_eq!(plain.debug_raster(), reattached.debug_raster());
+            assert_eq!(plain.interrupt_active(), reattached.interrupt_active());
+            assert_eq!(plain.cpu_clock_active(), reattached.cpu_clock_active());
+        }
+        assert_eq!(
+            plain.debug_raster().0,
+            1,
+            "the frame wrapped after line 311"
+        );
+        assert!(fb_plain == fb_reattached, "both drew the same border");
+        assert!(
+            fb_plain.contains(&3),
+            "the border colour reached the framebuffer"
+        );
+    }
 }
