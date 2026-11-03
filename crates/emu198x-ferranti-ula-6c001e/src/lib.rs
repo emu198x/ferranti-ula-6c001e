@@ -809,33 +809,47 @@ mod tests {
         );
     }
 
-    /// The Ferranti ULA ignores /RFSH, so a refresh address in
-    /// `$4000..=$7FFF` replaces the address of a colliding video fetch.
+    /// The Ferranti ULA ignores /RFSH, so a refresh in `$4000..=$7FFF`
+    /// that begins at fetch phase 3, just before the first fetch's row is
+    /// latched, gives that fetch the refresh's row (A0–A6) in its own
+    /// column. The line's fetches start at pixel 8; the one checked is the
+    /// third column's, at pixel 24, meant to read `$4002`, so the refresh
+    /// begins at pixel 19.
     #[test]
-    fn a_refresh_in_screen_ram_replaces_the_fetched_address_with_snow() {
-        let fetch_at_pixel_8 = |addr: u16, rfsh: bool| {
-            let mut ula = ula_at(0, 0);
+    fn a_refresh_beginning_before_a_fetch_in_screen_ram_snows_it() {
+        // `rfsh` is driven for the four ticks from pixel `begins`, or from
+        // pixel 17 if `None` (already under way at phase 3).
+        let fetch_at_pixel_24 = |addr: u16, rfsh: bool, begins: Option<u16>| {
+            let mut ula = ula_at(0, 8);
             let mut fb = framebuffer();
-            for _ in 0..9 {
-                ula.tick(&AddressedMemory, addr, false, false, rfsh, &mut fb);
+            for pixel in 8..25u16 {
+                let from = begins.unwrap_or(17);
+                let on = rfsh && (from..from + 4).contains(&pixel);
+                ula.tick(&AddressedMemory, addr, false, false, on, &mut fb);
             }
             ula.floating_bus()
         };
+        let clean = AddressedMemory.read(0x4002);
 
         assert_eq!(
-            fetch_at_pixel_8(0x7F00, true),
-            0x7F,
-            "I=$7F refresh is fetched"
+            fetch_at_pixel_24(0x7F35, true, Some(19)),
+            AddressedMemory.read(0x4035),
+            "I=$7F, R=$35: row $35, column unchanged"
         );
         assert_eq!(
-            fetch_at_pixel_8(0x3F00, true),
-            0x40,
+            fetch_at_pixel_24(0x3F35, true, Some(19)),
+            clean,
             "a refresh outside screen RAM leaves the fetch alone",
         );
         assert_eq!(
-            fetch_at_pixel_8(0x7F00, false),
-            0x40,
+            fetch_at_pixel_24(0x7F35, false, Some(19)),
+            clean,
             "without /RFSH the address is not a refresh",
+        );
+        assert_eq!(
+            fetch_at_pixel_24(0x7F35, true, None),
+            clean,
+            "a refresh that began earlier doesn't snow this fetch",
         );
     }
 
